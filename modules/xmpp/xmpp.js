@@ -8,7 +8,6 @@ import * as JitsiConnectionEvents from '../../JitsiConnectionEvents';
 import { XMPPEvents } from '../../service/xmpp/XMPPEvents';
 import browser from '../browser';
 import { E2EEncryption } from '../e2ee/E2EEncryption';
-import FeatureFlags from '../flags/FeatureFlags';
 import Statistics from '../statistics/statistics';
 import GlobalOnErrorHandler from '../util/GlobalOnErrorHandler';
 import Listenable from '../util/Listenable';
@@ -255,14 +254,11 @@ export default class XMPP extends Listenable {
         }
 
         // Advertise source-name signaling when the endpoint supports it.
-        if (FeatureFlags.isSourceNameSignalingEnabled()) {
-            logger.info('Source-name signaling is enabled');
-            this.caps.addFeature('http://jitsi.org/source-name');
-        }
-        if (FeatureFlags.isReceiveMultipleVideoStreamsSupported()) {
-            logger.info('Receiving multiple video streams is enabled');
-            this.caps.addFeature('http://jitsi.org/receive-multiple-video-streams');
-        }
+        logger.debug('Source-name signaling is enabled');
+        this.caps.addFeature('http://jitsi.org/source-name');
+
+        logger.debug('Receiving multiple video streams is enabled');
+        this.caps.addFeature('http://jitsi.org/receive-multiple-video-streams');
     }
 
     /**
@@ -939,11 +935,11 @@ export default class XMPP extends Listenable {
     }
 
     /**
-     * Sends face expressions to speaker stats component.
+     * Sends face landmarks to speaker stats component.
      * @param {String} roomJid - The room jid where the speaker event occurred.
      * @param {Object} payload - The expression to be sent to the speaker stats.
      */
-    sendFaceExpressionEvent(roomJid, payload) {
+    sendFaceLandmarksEvent(roomJid, payload) {
         // no speaker stats component advertised
         if (!this.speakerStatsComponentAddress || !roomJid) {
             return;
@@ -951,10 +947,11 @@ export default class XMPP extends Listenable {
 
         const msg = $msg({ to: this.speakerStatsComponentAddress });
 
-        msg.c('faceExpression', {
+        msg.c('faceLandmarks', {
             xmlns: 'http://jitsi.org/jitmeet',
             room: roomJid,
-            expression: payload.faceExpression,
+            faceExpression: payload.faceExpression,
+            timestamp: payload.timestamp,
             duration: payload.duration
         }).up();
 

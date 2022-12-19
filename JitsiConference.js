@@ -17,10 +17,7 @@ import RTC from './modules/RTC/RTC';
 import { SS_DEFAULT_FRAME_RATE } from './modules/RTC/ScreenObtainer';
 import browser from './modules/browser';
 import ConnectionQuality from './modules/connectivity/ConnectionQuality';
-import IceFailedHandling
-    from './modules/connectivity/IceFailedHandling';
-import ParticipantConnectionStatusHandler
-    from './modules/connectivity/ParticipantConnectionStatus';
+import IceFailedHandling from './modules/connectivity/IceFailedHandling';
 import * as DetectionEvents from './modules/detection/DetectionEvents';
 import NoAudioSignalDetection from './modules/detection/NoAudioSignalDetection';
 import P2PDominantSpeakerDetection from './modules/detection/P2PDominantSpeakerDetection';
@@ -31,6 +28,7 @@ import { E2EEncryption } from './modules/e2ee/E2EEncryption';
 import E2ePing from './modules/e2eping/e2eping';
 import Jvb121EventGenerator from './modules/event/Jvb121EventGenerator';
 import FeatureFlags from './modules/flags/FeatureFlags';
+import { LiteModeContext } from './modules/litemode/LiteModeContext';
 import ReceiveVideoController from './modules/qualitycontrol/ReceiveVideoController';
 import SendVideoController from './modules/qualitycontrol/SendVideoController';
 import RecordingManager from './modules/recording/RecordingManager';
@@ -285,6 +283,12 @@ export default function JitsiConference(options) {
         this._e2eEncryption = new E2EEncryption(this);
     }
 
+    if (FeatureFlags.isRunInLiteModeEnabled()) {
+        logger.info('Lite mode enabled');
+
+        this._liteModeContext = new LiteModeContext(this);
+    }
+
     /**
      * Flag set to <tt>true</tt> when Jicofo sends a presence message indicating that the max audio sender limit has
      * been reached for the call. Once this is set, unmuting audio will be disabled from the client until it gets reset
@@ -422,29 +426,11 @@ JitsiConference.prototype._init = function(options = {}) {
     if (!this.rtc) {
         this.rtc = new RTC(this, options);
         this.eventManager.setupRTCListeners();
-        if (FeatureFlags.isSourceNameSignalingEnabled()) {
-            this._registerRtcListeners(this.rtc);
-        }
+        this._registerRtcListeners(this.rtc);
     }
 
     this.receiveVideoController = new ReceiveVideoController(this, this.rtc);
     this.sendVideoController = new SendVideoController(this, this.rtc);
-
-    // Do not initialize ParticipantConnectionStatusHandler when source-name signaling is enabled.
-    if (!FeatureFlags.isSourceNameSignalingEnabled()) {
-        this.participantConnectionStatus
-        = new ParticipantConnectionStatusHandler(
-            this.rtc,
-            this,
-            {
-                // These options are not public API, leaving it here only as an entry point through config for tuning
-                // up purposes. Default values should be adjusted as soon as optimal values are discovered.
-                p2pRtcMuteTimeout: config._p2pConnStatusRtcMuteTimeout,
-                rtcMuteTimeout: config._peerConnStatusRtcMuteTimeout,
-                outOfLastNTimeout: config._peerConnStatusOutOfLastNTimeout
-            });
-        this.participantConnectionStatus.init();
-    }
 
     // Add the ability to enable callStats only on a percentage of users based on config.js settings.
     let enableCallStats = true;
@@ -630,10 +616,6 @@ JitsiConference.prototype.isP2PTestModeEnabled = function() {
  * @returns {Promise}
  */
 JitsiConference.prototype.leave = async function(reason) {
-    if (this.participantConnectionStatus) {
-        this.participantConnectionStatus.dispose();
-        this.participantConnectionStatus = null;
-    }
     if (this.avgRtpStatsReporter) {
         this.avgRtpStatsReporter.dispose();
         this.avgRtpStatsReporter = null;
@@ -807,11 +789,7 @@ JitsiConference.prototype._sendBridgeVideoTypeMessage = function(localtrack) {
         videoType = BridgeVideoType.DESKTOP_HIGH_FPS;
     }
 
-    if (FeatureFlags.isSourceNameSignalingEnabled() && localtrack) {
-        this.rtc.sendSourceVideoType(localtrack.getSourceName(), videoType);
-    } else if (!FeatureFlags.isSourceNameSignalingEnabled()) {
-        this.rtc.setVideoType(videoType);
-    }
+    localtrack && this.rtc.sendSourceVideoType(localtrack.getSourceName(), videoType);
 };
 
 /**
@@ -1049,15 +1027,15 @@ JitsiConference.prototype.setDisplayName = function(name) {
     if (this.room) {
         const nickKey = 'nick';
 
-        // if there is no display name already set, avoid setting an empty one
-        if (!name && !this.room.getFromPresence(nickKey)) {
-            return;
+        if (name) {
+            this.room.addOrReplaceInPresence(nickKey, {
+                attributes: { xmlns: 'http://jabber.org/protocol/nick' },
+                value: name
+            }) && this.room.sendPresence();
+        } else if (this.room.getFromPresence(nickKey)) {
+            this.room.removeFromPresence(nickKey);
+            this.room.sendPresence();
         }
-
-        this.room.addOrReplaceInPresence(nickKey, {
-            attributes: { xmlns: 'http://jabber.org/protocol/nick' },
-            value: name
-        }) && this.room.sendPresence();
     }
 };
 
@@ -1129,7 +1107,7 @@ JitsiConference.prototype.addTrack = function(track) {
 
         // Currently, only adding multiple video streams of different video types is supported.
         // TODO - remove this limitation once issues with jitsi-meet trying to add multiple camera streams is fixed.
-        if (FeatureFlags.isMultiStreamSupportEnabled()
+        if (FeatureFlags.isMultiStreamSendSupportEnabled()
             && mediaType === MediaType.VIDEO
             && !localTracks.find(t => t.getVideoType() === track.getVideoType())) {
             const sourceName = getSourceNameForJitsiTrack(
@@ -1163,7 +1141,7 @@ JitsiConference.prototype.addTrack = function(track) {
             // Presence needs to be sent here for desktop track since we need the presence to reach the remote peer
             // before signaling so that a fake participant tile is created for screenshare. Otherwise, presence will
             // only be sent after a session-accept or source-add is ack'ed.
-            if (track.getVideoType() === VideoType.DESKTOP && FeatureFlags.isMultiStreamSupportEnabled()) {
+            if (track.getVideoType() === VideoType.DESKTOP && FeatureFlags.isMultiStreamSendSupportEnabled()) {
                 this._updateRoomPresence(this.getActiveMediaSession());
             }
         });
@@ -1220,8 +1198,13 @@ JitsiConference.prototype._fireMuteChangeEvent = function(track) {
     }
 
     // Send the video type message to the bridge if the track is not removed/added to the pc as part of
-    // the mute/unmute operation. This currently happens only on Firefox.
-    if (track.isVideoTrack() && !browser.doesVideoMuteByStreamRemove()) {
+    // the mute/unmute operation.
+    // In React Native we mute the camera by setting track.enabled but that doesn't
+    // work for screen-share tracks, so do the remove-as-mute for those.
+    const doesVideoMuteByStreamRemove
+        = browser.isReactNative() ? track.videoType === VideoType.DESKTOP : browser.doesVideoMuteByStreamRemove();
+
+    if (track.isVideoTrack() && !doesVideoMuteByStreamRemove) {
         this._sendBridgeVideoTypeMessage(track);
     }
 
@@ -1301,22 +1284,20 @@ JitsiConference.prototype.replaceTrack = function(oldTrack, newTrack) {
     const mediaType = oldTrack?.getType() || newTrack?.getType();
     const newVideoType = newTrack?.getVideoType();
 
-    if (FeatureFlags.isMultiStreamSupportEnabled() && oldTrack && newTrack && oldVideoType !== newVideoType) {
+    if (FeatureFlags.isMultiStreamSendSupportEnabled() && oldTrack && newTrack && oldVideoType !== newVideoType) {
         throw new Error(`Replacing a track of videoType=${oldVideoType} with a track of videoType=${newVideoType} is`
             + ' not supported in this mode.');
     }
 
-    if (FeatureFlags.isSourceNameSignalingEnabled() && newTrack) {
-        if (oldTrack) {
-            newTrack.setSourceName(oldTrack.getSourceName());
-        } else {
-            const sourceName = getSourceNameForJitsiTrack(
+    if (newTrack) {
+        const sourceName = oldTrack
+            ? oldTrack.getSourceName()
+            : getSourceNameForJitsiTrack(
                 this.myUserId(),
                 mediaType,
                 this.getLocalTracks(mediaType)?.length);
 
-            newTrack.setSourceName(sourceName);
-        }
+        newTrack.setSourceName(sourceName);
     }
     const oldTrackBelongsToConference = this === oldTrack?.conference;
 
@@ -1334,6 +1315,9 @@ JitsiConference.prototype.replaceTrack = function(oldTrack, newTrack) {
     // Now replace the stream at the lower levels
     return this._doReplaceTrack(oldTrackBelongsToConference ? oldTrack : null, newTrack)
         .then(() => {
+            if (oldTrackBelongsToConference && !oldTrack.isMuted() && !newTrack) {
+                oldTrack._sendMuteStatus(true);
+            }
             oldTrackBelongsToConference && this.onLocalTrackRemoved(oldTrack);
             newTrack && this._setupNewTrack(newTrack);
 
@@ -1422,7 +1406,7 @@ JitsiConference.prototype._setupNewTrack = function(newTrack) {
     }
 
     // Create a source name for this track if it doesn't exist.
-    if (FeatureFlags.isSourceNameSignalingEnabled() && !newTrack.getSourceName()) {
+    if (!newTrack.getSourceName()) {
         const sourceName = getSourceNameForJitsiTrack(
             this.myUserId(),
             mediaType,
@@ -1455,25 +1439,8 @@ JitsiConference.prototype._setupNewTrack = function(newTrack) {
 JitsiConference.prototype._setNewVideoType = function(track) {
     let videoTypeChanged = false;
 
-    if (FeatureFlags.isSourceNameSignalingEnabled() && track) {
+    if (track) {
         videoTypeChanged = this._signalingLayer.setTrackVideoType(track.getSourceName(), track.videoType);
-    }
-
-    if (!FeatureFlags.isMultiStreamSupportEnabled()) {
-        const videoTypeTagName = 'videoType';
-
-        // If track is missing we revert to default type Camera, the case where we screenshare and
-        // we return to be video muted.
-        const trackVideoType = track ? track.videoType : VideoType.CAMERA;
-
-        // If video type is camera and there is no videoType in presence, we skip adding it, as this is the default one
-        if (trackVideoType !== VideoType.CAMERA || this.room.getFromPresence(videoTypeTagName)) {
-            // We will not use this.sendCommand here to avoid sending the presence immediately, as later we may also
-            // set the mute status.
-            const legacyTypeChanged = this.room.addOrReplaceInPresence(videoTypeTagName, { value: trackVideoType });
-
-            videoTypeChanged = videoTypeChanged || legacyTypeChanged;
-        }
     }
 
     return videoTypeChanged;
@@ -1490,26 +1457,8 @@ JitsiConference.prototype._setNewVideoType = function(track) {
 JitsiConference.prototype._setTrackMuteStatus = function(mediaType, localTrack, isMuted) {
     let presenceChanged = false;
 
-    if (FeatureFlags.isSourceNameSignalingEnabled() && localTrack) {
+    if (localTrack) {
         presenceChanged = this._signalingLayer.setTrackMuteStatus(localTrack.getSourceName(), isMuted);
-    }
-
-    // Add the 'audioMuted' and 'videoMuted' tags when source name signaling is enabled for backward compatibility.
-    // It won't be used anymore when multiple stream support is enabled.
-    if (!FeatureFlags.isMultiStreamSupportEnabled()) {
-        let audioMuteChanged, videoMuteChanged;
-
-        if (!this.room) {
-            return false;
-        }
-
-        if (mediaType === MediaType.AUDIO) {
-            audioMuteChanged = this.room.addAudioInfoToPresence(isMuted);
-        } else {
-            videoMuteChanged = this.room.addVideoInfoToPresence(isMuted);
-        }
-
-        presenceChanged = presenceChanged || audioMuteChanged || videoMuteChanged;
     }
 
     return presenceChanged;
@@ -1706,20 +1655,6 @@ JitsiConference.prototype.setLastN = function(lastN) {
 };
 
 /**
- * Checks if the participant given by participantId is currently included in
- * the last N.
- * @param {string} participantId the identifier of the participant we would
- * like to check.
- * @return {boolean} true if the participant with id is in the last N set or
- * if there's no last N set, false otherwise.
- * @deprecated this method should never be used to figure out the UI, but
- * {@link ParticipantConnectionStatus} should be used instead.
- */
-JitsiConference.prototype.isInLastN = function(participantId) {
-    return this.rtc.isInLastN(participantId);
-};
-
-/**
  * @return Array<JitsiParticipant> an array of all participants in this
  * conference.
  */
@@ -1881,15 +1816,22 @@ JitsiConference.prototype.onMemberJoined = function(
     if (id === 'focus' || this.myUserId() === id) {
         return;
     }
-
-    const participant
-        = new JitsiParticipant(jid, this, nick, isHidden, statsID, status, identity);
+    const participant = new JitsiParticipant(jid, this, nick, isHidden, statsID, status, identity);
 
     participant.setConnectionJid(fullJid);
     participant.setRole(role);
     participant.setBotType(botType);
     participant.setFeatures(features);
     participant.setIsReplacing(isReplaceParticipant);
+
+    // Set remote tracks on the participant if source signaling was received before presence.
+    const remoteTracks = this.isP2PActive()
+        ? this.p2pJingleSession?.peerconnection.getRemoteTracks(id) ?? []
+        : this.jvbJingleSession?.peerconnection.getRemoteTracks(id) ?? [];
+
+    for (const track of remoteTracks) {
+        participant._tracks.push(track);
+    }
 
     this.participants[id] = participant;
     this.eventEmitter.emit(
@@ -2119,14 +2061,12 @@ JitsiConference.prototype.onRemoteTrackAdded = function(track) {
     const id = track.getParticipantId();
     const participant = this.getParticipantById(id);
 
-    if (!participant) {
-        logger.error(`No participant found for id: ${id}`);
-
-        return;
-    }
-
     // Add track to JitsiParticipant.
-    participant._tracks.push(track);
+    if (participant) {
+        participant._tracks.push(track);
+    } else {
+        logger.info(`Source signaling received before presence for ${id}`);
+    }
 
     if (this.transcriber) {
         this.transcriber.addTrack(track);
@@ -2318,7 +2258,7 @@ JitsiConference.prototype._acceptJvbIncomingCall = function(jingleSession, jingl
             this._signalingLayer,
             {
                 ...this.options.config,
-                enableInsertableStreams: this.isE2EEEnabled()
+                enableInsertableStreams: this.isE2EEEnabled() || FeatureFlags.isRunInLiteModeEnabled()
             });
     } catch (error) {
         GlobalOnErrorHandler.callErrorHandler(error);
@@ -3077,7 +3017,7 @@ JitsiConference.prototype._acceptP2PIncomingCall = function(jingleSession, jingl
         this._signalingLayer,
         {
             ...this.options.config,
-            enableInsertableStreams: this.isE2EEEnabled()
+            enableInsertableStreams: this.isE2EEEnabled() || FeatureFlags.isRunInLiteModeEnabled()
         });
 
     logger.info('Starting CallStats for P2P connection...');
@@ -3269,10 +3209,7 @@ JitsiConference.prototype._updateProperties = function(properties = {}) {
 
             // The number of jitsi-videobridge instances currently used for the
             // conference.
-            'bridge-count',
-
-            // The conference creation time (set by jicofo).
-            'created-ms'
+            'bridge-count'
         ];
 
         analyticsKeys.forEach(key => {
@@ -3448,7 +3385,7 @@ JitsiConference.prototype._startP2PSession = function(remoteJid) {
         this._signalingLayer,
         {
             ...this.options.config,
-            enableInsertableStreams: this.isE2EEEnabled()
+            enableInsertableStreams: this.isE2EEEnabled() || FeatureFlags.isRunInLiteModeEnabled()
         });
 
     logger.info('Starting CallStats for P2P connection...');
@@ -3691,8 +3628,6 @@ JitsiConference.prototype._updateRoomPresence = function(jingleSession, ctx) {
     let presenceChanged = false;
     let muteStatusChanged, videoTypeChanged;
     const localTracks = jingleSession.peerconnection.getLocalTracks();
-    const localAudioTracks = localTracks.filter(track => track.getType() === MediaType.AUDIO);
-    const localVideoTracks = localTracks.filter(track => track.getType() === MediaType.VIDEO);
 
     // Set presence for all the available local tracks.
     for (const track of localTracks) {
@@ -3701,21 +3636,6 @@ JitsiConference.prototype._updateRoomPresence = function(jingleSession, ctx) {
             videoTypeChanged = this._setNewVideoType(track);
         }
         presenceChanged = presenceChanged || muteStatusChanged || videoTypeChanged;
-    }
-
-    // Set the presence in the legacy format if there are no local tracks and multi stream support is not enabled.
-    if (!FeatureFlags.isMultiStreamSupportEnabled()) {
-        let audioMuteStatusChanged, videoMuteStatusChanged;
-
-        if (!localAudioTracks?.length) {
-            audioMuteStatusChanged = this._setTrackMuteStatus(MediaType.AUDIO, undefined, true);
-        }
-        if (!localVideoTracks?.length) {
-            videoMuteStatusChanged = this._setTrackMuteStatus(MediaType.VIDEO, undefined, true);
-            videoTypeChanged = this._setNewVideoType();
-        }
-
-        presenceChanged = presenceChanged || audioMuteStatusChanged || videoMuteStatusChanged || videoTypeChanged;
     }
 
     presenceChanged && this.room.sendPresence();
@@ -3807,7 +3727,7 @@ JitsiConference.prototype.getSpeakerStats = function() {
  */
 JitsiConference.prototype.sendFaceLandmarks = function(payload) {
     if (payload.faceExpression) {
-        this.xmpp.sendFaceExpressionEvent(this.room.roomjid, payload);
+        this.xmpp.sendFaceLandmarksEvent(this.room.roomjid, payload);
     }
 };
 
@@ -3991,6 +3911,40 @@ JitsiConference.prototype.toggleE2EE = function(enabled) {
  */
 JitsiConference.prototype.setMediaEncryptionKey = function(keyInfo) {
     this._e2eEncryption.setEncryptionKey(keyInfo);
+};
+
+/**
+ * Starts the participant verification process.
+ *
+ * @param {string} participantId The participant which will be marked as verified.
+ * @returns {void}
+ */
+JitsiConference.prototype.startVerification = function(participantId) {
+    const participant = this.getParticipantById(participantId);
+
+    if (!participant) {
+        return;
+    }
+
+    this._e2eEncryption.startVerification(participant);
+};
+
+/**
+ * Marks the given participant as verified. After this is done, MAC verification will
+ * be performed and an event will be emitted with the result.
+ *
+ * @param {string} participantId The participant which will be marked as verified.
+ * @param {boolean} isVerified - whether the verification was succesfull.
+ * @returns {void}
+ */
+JitsiConference.prototype.markParticipantVerified = function(participantId, isVerified) {
+    const participant = this.getParticipantById(participantId);
+
+    if (!participant) {
+        return;
+    }
+
+    this._e2eEncryption.markParticipantVerified(participant, isVerified);
 };
 
 /**
