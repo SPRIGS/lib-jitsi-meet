@@ -225,6 +225,8 @@ JitsiConferenceEventManager.prototype.setupChatRoomListeners = function() {
     this.chatRoomForwarder.forward(XMPPEvents.REDIRECTED,
         JitsiConferenceEvents.CONFERENCE_FAILED,
         JitsiConferenceErrors.REDIRECTED);
+    chatRoom.addListener(XMPPEvents.REDIRECTED,
+        () => conference.leave().catch(e => logger.log('Error leaving on redirected', e)));
 
     this.chatRoomForwarder.forward(XMPPEvents.BRIDGE_DOWN,
         JitsiConferenceEvents.CONFERENCE_FAILED,
@@ -395,12 +397,12 @@ JitsiConferenceEventManager.prototype.setupChatRoomListeners = function() {
         XMPPEvents.MESSAGE_RECEIVED,
 
         // eslint-disable-next-line max-params
-        (jid, txt, myJid, ts) => {
+        (jid, txt, myJid, ts, nick, isGuest) => {
             const id = Strophe.getResourceFromJid(jid);
 
             conference.eventEmitter.emit(
                 JitsiConferenceEvents.MESSAGE_RECEIVED,
-                id, txt, ts);
+                id, txt, ts, nick, isGuest);
         });
 
     chatRoom.addListener(
@@ -445,22 +447,16 @@ JitsiConferenceEventManager.prototype.setupChatRoomListeners = function() {
         });
 
     chatRoom.addPresenceListener('startmuted', (data, from) => {
-        let isModerator = false;
-
-        if (conference.myUserId() === from && conference.isModerator()) {
-            isModerator = true;
-        } else {
-            const participant = conference.getParticipantById(from);
-
-            if (participant && participant.isModerator()) {
-                isModerator = true;
-            }
-        }
-
-        if (!isModerator) {
+        // Ignore the strartmuted policy if the presence is received from self. The moderator should join with
+        // available local sources and the policy needs to be applied only on users that join the call after.
+        if (conference.myUserId() === from) {
             return;
         }
+        const participant = conference.getParticipantById(from);
 
+        if (!participant || !participant.isModerator()) {
+            return;
+        }
         const startAudioMuted = data.attributes.audio === 'true';
         const startVideoMuted = data.attributes.video === 'true';
 
@@ -574,15 +570,15 @@ JitsiConferenceEventManager.prototype.setupRTCListeners = function() {
     });
 
     rtc.addListener(RTCEvents.VIDEO_SSRCS_REMAPPED, msg => {
-        const sess = this.conference.getActiveMediaSession();
-
-        sess.videoSsrcsRemapped(msg);
+        for (const session of this.conference.getMediaSessions()) {
+            session.processSourceMap(msg, MediaType.VIDEO);
+        }
     });
 
     rtc.addListener(RTCEvents.AUDIO_SSRCS_REMAPPED, msg => {
-        const sess = this.conference.getActiveMediaSession();
-
-        sess.audioSsrcsRemapped(msg);
+        for (const session of this.conference.getMediaSessions()) {
+            session.processSourceMap(msg, MediaType.AUDIO);
+        }
     });
 
     rtc.addListener(RTCEvents.ENDPOINT_MESSAGE_RECEIVED,

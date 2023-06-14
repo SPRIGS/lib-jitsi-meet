@@ -265,12 +265,19 @@ export default class JitsiRemoteTrack extends JitsiTrack {
      * Update the properties when the track is remapped to another source.
      *
      * @param {string} owner The endpoint ID of the new owner.
-     * @param {string} name The new source name.
      */
-    setNewSource(owner, name) {
+    setOwner(owner) {
         this.ownerEndpointId = owner;
-        this._sourceName = name;
         this.emit(JitsiTrackEvents.TRACK_OWNER_CHANGED, owner);
+    }
+
+    /**
+     * Sets the name of the source associated with the remtoe track.
+     *
+     * @param {string} name - The source name to be associated with the track.
+     */
+    setSourceName(name) {
+        this._sourceName = name;
     }
 
     /**
@@ -298,7 +305,7 @@ export default class JitsiRemoteTrack extends JitsiTrack {
 
         const now = window.performance.now();
 
-        console.log(`(TIME) Render ${type}:\t`, now);
+        logger.info(`(TIME) Render ${type}:\t`, now);
         this.conference.getConnectionTimes()[`${type}.render`] = now;
 
         // The conference can be started without calling GUM
@@ -317,7 +324,7 @@ export default class JitsiRemoteTrack extends JitsiTrack {
             - gumDuration;
 
         this.conference.getConnectionTimes()[`${type}.ttfm`] = ttfm;
-        console.log(`(TIME) TTFM ${type}:\t`, ttfm);
+        logger.info(`(TIME) TTFM ${type}:\t`, ttfm);
 
         Statistics.sendAnalytics(createTtfmEvent(
             {
